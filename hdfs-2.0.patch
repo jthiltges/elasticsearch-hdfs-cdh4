@@ -1,0 +1,129 @@
+diff --git a/plugins/repository-hdfs/build.gradle b/plugins/repository-hdfs/build.gradle
+index fccfb0e..d719a64 100644
+--- a/plugins/repository-hdfs/build.gradle
++++ b/plugins/repository-hdfs/build.gradle
+@@ -33,9 +33,15 @@ esplugin {
+ apply plugin: 'elasticsearch.vagrantsupport'
+ 
+ versions << [
+-  'hadoop2': '2.8.1'
++  'hadoop2': '2.0.0-cdh4.7.1'
+ ]
+ 
++repositories {
++    maven {
++        url "https://repository.cloudera.com/artifactory/cloudera-repos/"
++    }
++}
++
+ configurations {
+   hdfsFixture
+ }
+@@ -46,10 +52,9 @@ dependencies {
+   compile "org.apache.hadoop:hadoop-annotations:${versions.hadoop2}"
+   compile "org.apache.hadoop:hadoop-auth:${versions.hadoop2}"
+   compile "org.apache.hadoop:hadoop-hdfs:${versions.hadoop2}"
+-  compile "org.apache.hadoop:hadoop-hdfs-client:${versions.hadoop2}"
+   compile 'org.apache.htrace:htrace-core4:4.0.1-incubating'
+   compile 'com.google.guava:guava:11.0.2'
+-  compile 'com.google.protobuf:protobuf-java:2.5.0'
++  compile 'com.google.protobuf:protobuf-java:2.4.0a'
+   compile 'commons-logging:commons-logging:1.1.3'
+   compile 'commons-cli:commons-cli:1.2'
+   compile 'commons-codec:commons-codec:1.10'
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
+index f1ad57f..3c5ff56 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsRepository.java
+@@ -18,6 +18,9 @@
+  */
+ package org.elasticsearch.repositories.hdfs;
+ 
++import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION;
++import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX;
++
+ import java.io.IOException;
+ import java.io.UncheckedIOException;
+ import java.net.InetAddress;
+@@ -33,7 +36,6 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.AbstractFileSystem;
+ import org.apache.hadoop.fs.FileContext;
+ import org.apache.hadoop.fs.UnsupportedFileSystemException;
+-import org.apache.hadoop.hdfs.client.HdfsClientConfigKeys;
+ import org.apache.hadoop.io.retry.FailoverProxyProvider;
+ import org.apache.hadoop.security.SecurityUtil;
+ import org.apache.hadoop.security.UserGroupInformation;
+@@ -131,7 +133,7 @@ public final class HdfsRepository extends BlobStoreRepository {
+         // HA requires elevated permissions during regular usage in the event that a failover operation
+         // occurs and a new connection is required.
+         String host = uri.getHost();
+-        String configKey = HdfsClientConfigKeys.Failover.PROXY_PROVIDER_KEY_PREFIX + "." + host;
++        String configKey = DFS_CLIENT_FAILOVER_PROXY_PROVIDER_KEY_PREFIX + "." + host;
+         Class<?> ret = hadoopConfiguration.getClass(configKey, null, FailoverProxyProvider.class);
+         boolean haEnabled = ret != null;
+ 
+@@ -157,9 +159,31 @@ public final class HdfsRepository extends BlobStoreRepository {
+         }
+     }
+ 
++    // Duplicated from hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/SecurityUtil.java
++    // tag release-2.0.3-alpha
++    private static AuthenticationMethod getAuthenticationMethod(Configuration conf) {
++        String value = conf.get(HADOOP_SECURITY_AUTHENTICATION, "simple");
++        try {
++            return Enum.valueOf(AuthenticationMethod.class, value.toUpperCase(Locale.ROOT));
++        } catch (IllegalArgumentException iae) {
++            throw new IllegalArgumentException("Invalid attribute value for " +
++                    HADOOP_SECURITY_AUTHENTICATION + " of " + value);
++        }
++    }
++
++    private static void setAuthenticationMethod(
++            AuthenticationMethod authenticationMethod, Configuration conf) {
++        if (authenticationMethod == null) {
++            authenticationMethod = AuthenticationMethod.SIMPLE;
++        }
++        conf.set(HADOOP_SECURITY_AUTHENTICATION,
++                         authenticationMethod.toString().toLowerCase(Locale.ROOT));
++    }
++    // END
++
+     private UserGroupInformation login(Configuration hadoopConfiguration, Settings repositorySettings) {
+         // Validate the authentication method:
+-        AuthenticationMethod authMethod = SecurityUtil.getAuthenticationMethod(hadoopConfiguration);
++        AuthenticationMethod authMethod = getAuthenticationMethod(hadoopConfiguration);
+         if (authMethod.equals(AuthenticationMethod.SIMPLE) == false
+             && authMethod.equals(AuthenticationMethod.KERBEROS) == false) {
+             throw new RuntimeException("Unsupported authorization mode ["+authMethod+"]");
+@@ -172,7 +196,7 @@ public final class HdfsRepository extends BlobStoreRepository {
+         if (kerberosPrincipal != null && authMethod.equals(AuthenticationMethod.SIMPLE)) {
+             LOGGER.warn("Hadoop authentication method is set to [SIMPLE], but a Kerberos principal is " +
+                 "specified. Continuing with [KERBEROS] authentication.");
+-            SecurityUtil.setAuthenticationMethod(AuthenticationMethod.KERBEROS, hadoopConfiguration);
++            setAuthenticationMethod(AuthenticationMethod.KERBEROS, hadoopConfiguration);
+         } else if (kerberosPrincipal == null && authMethod.equals(AuthenticationMethod.KERBEROS)) {
+             throw new RuntimeException("HDFS Repository does not support [KERBEROS] authentication without " +
+                 "a valid Kerberos principal and keytab. Please specify a principal in the repository settings with [" +
+@@ -184,7 +208,7 @@ public final class HdfsRepository extends BlobStoreRepository {
+ 
+         // Debugging
+         LOGGER.debug("Hadoop security enabled: [{}]", UserGroupInformation.isSecurityEnabled());
+-        LOGGER.debug("Using Hadoop authentication method: [{}]", SecurityUtil.getAuthenticationMethod(hadoopConfiguration));
++        LOGGER.debug("Using Hadoop authentication method: [{}]", getAuthenticationMethod(hadoopConfiguration));
+ 
+         // UserGroupInformation (UGI) instance is just a Hadoop specific wrapper around a Java Subject
+         try {
+diff --git a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
+index fe573d3..7ec6b46 100644
+--- a/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
++++ b/plugins/repository-hdfs/src/main/java/org/elasticsearch/repositories/hdfs/HdfsSecurityContext.java
+@@ -56,7 +56,8 @@ class HdfsSecurityContext {
+             // 2) allow hadoop to add credentials to our Subject
+             new AuthPermission("modifyPrivateCredentials"),
+             // 3) RPC Engine requires this for re-establishing pooled connections over the lifetime of the client
+-            new PrivateCredentialPermission("org.apache.hadoop.security.Credentials * \"*\"", "read")
++            new PrivateCredentialPermission("org.apache.hadoop.security.Credentials * \"*\"", "read"),
++            new RuntimePermission("getClassLoader")
+         };
+ 
+         // If Security is enabled, we need all the following elevated permissions:
